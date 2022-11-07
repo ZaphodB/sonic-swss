@@ -28,18 +28,22 @@ using namespace swss;
 #define LOOPBACK_DEFAULT_MTU_STR "65536"
 #define DEFAULT_MTU_STR 9100
 
+extern MacAddress gMacAddress;
+
 IntfMgr::IntfMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb, const vector<string> &tableNames) :
         Orch(cfgDb, tableNames),
         m_cfgIntfTable(cfgDb, CFG_INTF_TABLE_NAME),
         m_cfgVlanIntfTable(cfgDb, CFG_VLAN_INTF_TABLE_NAME),
         m_cfgLagIntfTable(cfgDb, CFG_LAG_INTF_TABLE_NAME),
         m_cfgLoopbackIntfTable(cfgDb, CFG_LOOPBACK_INTERFACE_TABLE_NAME),
+        m_cfgSagTable(cfgDb, CFG_SAG_TABLE_NAME),
         m_statePortTable(stateDb, STATE_PORT_TABLE_NAME),
         m_stateLagTable(stateDb, STATE_LAG_TABLE_NAME),
         m_stateVlanTable(stateDb, STATE_VLAN_TABLE_NAME),
         m_stateVrfTable(stateDb, STATE_VRF_TABLE_NAME),
         m_stateIntfTable(stateDb, STATE_INTERFACE_TABLE_NAME),
         m_appIntfTableProducer(appDb, APP_INTF_TABLE_NAME),
+        m_appSagTableProducer(appDb, APP_SAG_TABLE_NAME),
         m_neighTable(appDb, APP_NEIGH_TABLE_NAME),
         m_appLagTable(appDb, APP_LAG_TABLE_NAME)
 {
@@ -745,6 +749,7 @@ bool IntfMgr::doIntfGeneralTask(const vector<string>& keys,
     string mpls = "";
     string ipv6_link_local_mode = "";
     string loopback_action = "";
+    string sag = "";
 
     for (auto idx : data)
     {
@@ -782,6 +787,10 @@ bool IntfMgr::doIntfGeneralTask(const vector<string>& keys,
         else if (field == "ipv6_use_link_local_only")
         {
             ipv6_link_local_mode = value;
+        }
+        else if (field == "static_anycast_gateway")
+        {
+            sag = value;
         }
         else if (field == "vlan")
         {
@@ -958,8 +967,55 @@ bool IntfMgr::doIntfGeneralTask(const vector<string>& keys,
         }
         else
         {
-            FieldValueTuple fvTuple("mac_addr", MacAddress().to_string());
-            data.push_back(fvTuple);
+            if (!sag.empty())
+            {
+                // only VLAN interface can set static anycast gateway
+                if (!alias.compare(0, strlen(VLAN_PREFIX), VLAN_PREFIX))
+                {
+                    vector<FieldValueTuple> fvs;
+                    string gwmac = "";
+                    if (m_cfgSagTable.get("GLOBAL", fvs))
+                    {
+                        for (auto idx: fvs)
+                        {
+                            const auto &field = fvField(idx);
+                            const auto &value = fvValue(idx);
+
+                            if (field == "gateway_mac")
+                            {
+                                gwmac = value;
+                            }
+                        }
+                    }
+
+                    if (!gwmac.empty())
+                    {
+                        if (sag == "true")
+                        {
+                            updateSubIntfAdminStatus(alias, "down");
+                            setIntfMac(alias, gwmac);
+                            updateSubIntfAdminStatus(alias, "up");
+
+                            FieldValueTuple fvTuple("mac_addr", MacAddress(gwmac).to_string());
+                            data.push_back(fvTuple);
+                        }
+                        else if (sag == "false")
+                        {
+                            updateSubIntfAdminStatus(alias, "down");
+                            setIntfMac(alias, gMacAddress.to_string());
+                            updateSubIntfAdminStatus(alias, "up");
+
+                            FieldValueTuple fvTuple("mac_addr", MacAddress().to_string());
+                            data.push_back(fvTuple);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                FieldValueTuple fvTuple("mac_addr", MacAddress().to_string());
+                data.push_back(fvTuple);
+            }
         }
 
         if (!proxy_arp.empty())
@@ -1094,6 +1150,42 @@ bool IntfMgr::doIntfAddrTask(const vector<string>& keys,
     return true;
 }
 
+void IntfMgr::doSagTask(const vector<string>& keys,
+        const vector<FieldValueTuple> &data,
+        const string& op)
+{
+    SWSS_LOG_ENTER();
+
+    string mac = "";
+    for (auto idx : data)
+    {
+        const auto &field = fvField(idx);
+        const auto &value = fvValue(idx);
+
+        if (field == "gateway_mac")
+        {
+            mac = value;
+        }
+    }
+
+    vector<FieldValueTuple> fvAppSag;
+    if (op == SET_COMMAND)
+    {
+        FieldValueTuple gwmac("gateway_mac", MacAddress(mac).to_string());
+        fvAppSag.push_back(gwmac);
+        m_appSagTableProducer.set("GLOBAL", fvAppSag);
+
+        updateSagMac(mac);
+    }
+    else if (op == DEL_COMMAND)
+    {
+        m_appSagTableProducer.del("GLOBAL");
+
+        // reset mac address for enabled static-anycast-gateway's VLAN interfaces
+        updateSagMac(gMacAddress.to_string());
+    }
+}
+
 void IntfMgr::doTask(Consumer &consumer)
 {
     SWSS_LOG_ENTER();
@@ -1126,6 +1218,14 @@ void IntfMgr::doTask(Consumer &consumer)
                     it = consumer.m_toSync.erase(it);
                     continue;
                 }
+
+                if (table_name == CFG_SAG_TABLE_NAME)
+                {
+                    doSagTask(keys, data, op);
+                    it = consumer.m_toSync.erase(it);
+                    continue;
+                }
+    
                 if (!doIntfGeneralTask(keys, data, op))
                 {
                     it++;
@@ -1196,4 +1296,45 @@ bool IntfMgr::enableIpv6Flag(const string &alias)
     int ret = swss::exec(cmd.str(), temp_res);
     SWSS_LOG_INFO("disable_ipv6 flag is set to 0 for iface: %s, cmd: %s, ret: %d", alias.c_str(), cmd.str().c_str(), ret);
     return (ret == 0) ? true : false;
+}
+
+void IntfMgr::updateSagMac(const std::string &macAddr)
+{
+    vector<string> keys;
+    m_cfgVlanIntfTable.getKeys(keys);
+    for (auto &key: keys)
+    {
+        vector<string> entryKeys = tokenize(key, config_db_key_delimiter);
+        if (key.compare(0, strlen(VLAN_PREFIX), VLAN_PREFIX))
+        {
+            continue;
+        }
+
+        if (entryKeys.size() != 1)
+        {
+            continue;
+        }
+
+        vector<FieldValueTuple> fvs;
+        m_cfgVlanIntfTable.get(key, fvs);
+        for (auto &fv: fvs)
+        {
+            std::string field = fvField(fv);
+            std::string value = fvValue(fv);
+            if (field == "static_anycast_gateway" && value == "true")
+            {
+                SWSS_LOG_NOTICE("set %s mac address to %s", key.c_str(), macAddr.c_str());
+
+                // enable SAG
+                updateSubIntfAdminStatus(key, "down");
+                setIntfMac(key, macAddr);
+                updateSubIntfAdminStatus(key, "up");
+
+                vector<FieldValueTuple> vlanIntFv;
+                FieldValueTuple fvTuple("mac_addr", MacAddress(macAddr).to_string());
+                vlanIntFv.push_back(fvTuple);
+                m_appIntfTableProducer.set(key, vlanIntFv);
+            }
+        }
+    }
 }
