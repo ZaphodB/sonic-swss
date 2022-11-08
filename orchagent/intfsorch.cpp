@@ -30,6 +30,7 @@ extern sai_vlan_api_t*              sai_vlan_api;
 
 extern sai_object_id_t gSwitchId;
 extern PortsOrch *gPortsOrch;
+extern RouteOrch *gRouteOrch;
 extern FlowCounterRouteOrch *gFlowCounterRouteOrch;
 extern CrmOrch *gCrmOrch;
 extern BufferOrch *gBufferOrch;
